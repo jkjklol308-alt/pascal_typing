@@ -21,9 +21,13 @@ A next-generation human typing simulator implementing:
   6. Multi-stream Seeded RNG (independent streams for timing, errors, cognition,
      and navigation).
   7. Strict Invariant Validation & Closed-Loop Calibration.
+  8. Silent Update Check (compares APP_VERSION against the published copy on
+     GitHub each time the UI opens; stays completely quiet unless a newer
+     version exists, and never blocks startup or forces an upgrade).
 
 Usage:
     python auto_typer_V2.py --benchmark --wpm 110 --mode net --coding-mode --file code.pas
+    python auto_typer_V2.py --check-update
     python auto_typer_V2.py  (launches interactive UI)
 ===============================================================================
 """
@@ -41,6 +45,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
+import webbrowser
 from pathlib import Path
 from collections import Counter
 from dataclasses import dataclass, field
@@ -51,6 +57,12 @@ try:
     from tkinter import messagebox, ttk
 except ImportError:
     tk = messagebox = ttk = None
+
+APP_VERSION = "2.0.0"
+GITHUB_REPO = "jkjklol308-alt/pascal_typing"
+UPDATE_SOURCE_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/auto_typer_V2.py"
+UPDATE_PAGE_URL = f"https://github.com/{GITHUB_REPO}/blob/main/auto_typer_V2.py"
+UPDATE_CHECK_TIMEOUT = 5.0
 
 # =============================================================================
 # 1. PHYSICAL KEYBOARD GEOMETRY & BIOMECHANICAL FINGER ASSIGNMENTS
@@ -1512,7 +1524,112 @@ class TracePlayer:
 
 
 # =============================================================================
-# 10. GRAPHICAL INTERFACE
+# 10. UPDATE CHECKING (SILENT, NON-BLOCKING, NEVER FORCED)
+# =============================================================================
+
+_VERSION_DECLARATION = re.compile(
+    r'^[ \t]*APP_VERSION[ \t]*=[ \t]*["\']([0-9A-Za-z._+-]+)["\']', re.MULTILINE
+)
+
+
+def _numeric_prefix(part: str) -> Optional[int]:
+    digits = ""
+    for ch in part:
+        if not ch.isdigit():
+            break
+        digits += ch
+    return int(digits) if digits else None
+
+
+def parse_version(version) -> Optional[Tuple[int, ...]]:
+    """Parse a dotted version string into a comparable integer tuple.
+
+    Tolerates a leading "v", surrounding whitespace, and trailing junk on a
+    component ("2.0.0rc1" parses as (2, 0, 0)). Returns None when the string
+    does not start with a number, so malformed data can never look "newer".
+    """
+    if not isinstance(version, str):
+        return None
+    text = version.strip()
+    if text[:1] in ("v", "V"):
+        text = text[1:]
+    numbers: List[int] = []
+    for part in text.split("."):
+        value = _numeric_prefix(part)
+        if value is None:
+            if numbers:
+                break  # trailing junk such as "-beta" on the last component
+            return None
+        numbers.append(value)
+    return tuple(numbers) if numbers else None
+
+
+def is_newer_version(candidate: str, current: str) -> bool:
+    """True only when `candidate` is strictly newer than `current`.
+
+    Any unparsable input yields False: a garbled response must never
+    produce an "update available" notification.
+    """
+    remote = parse_version(candidate)
+    local = parse_version(current)
+    if remote is None or local is None:
+        return False
+    return remote > local
+
+
+def update_to_announce(latest: Optional[str], current: str) -> Optional[str]:
+    """Return the version string to announce to the user, or None.
+
+    None (and therefore silence) is returned when there is no information,
+    when the published version cannot be parsed, or when it is not newer
+    than the running version. This is the single decision point that keeps
+    the automatic check quiet unless an update genuinely exists.
+    """
+    if latest is None or not is_newer_version(latest, current):
+        return None
+    return latest
+
+
+def extract_version_from_source(source: str) -> Optional[str]:
+    """Return the APP_VERSION declared in a copy of this module's source."""
+    if not source:
+        return None
+    match = _VERSION_DECLARATION.search(source)
+    return match.group(1) if match else None
+
+
+class UpdateChecker:
+    """Best-effort reader for the published APP_VERSION on GitHub main.
+
+    Contract relied on by the GUI:
+      * Returns the published version string, or None.
+      * None means "no information" (offline, HTTP error, timeout, or a
+        payload without a parsable version). Callers must treat None as
+        "say nothing" -- never as "update available" or "up to date".
+    """
+
+    def __init__(self, source_url: str = UPDATE_SOURCE_URL, timeout: float = UPDATE_CHECK_TIMEOUT):
+        self.source_url = source_url
+        self.timeout = timeout
+
+    def fetch_latest_version(self) -> Optional[str]:
+        try:
+            request = urllib.request.Request(
+                self.source_url,
+                headers={"User-Agent": f"pascal-typing-auto-typer-v2/{APP_VERSION}"},
+            )
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                status = getattr(response, "status", 200)
+                if status != 200:
+                    return None
+                payload = response.read(1 << 20).decode("utf-8", errors="replace")
+        except Exception:
+            # Best effort by design: any failure simply means "no information".
+            return None
+        return extract_version_from_source(payload)
+
+# =============================================================================
+# 11. GRAPHICAL INTERFACE
 # =============================================================================
 
 PALETTE_DEFINITIONS = {
@@ -1637,6 +1754,7 @@ class AutoTyperV2App(_TkBase):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_id = self.after(50, self._poll_queue)
+        self._start_update_check()
 
     # ------------------------------------------------------------------
     # Theme and settings window
@@ -1860,6 +1978,10 @@ class AutoTyperV2App(_TkBase):
             selectcolor=self.colors["surface"], anchor="w",
         )
         self._topmost_checkbutton.pack(anchor="w")
+        self._update_check_button = ttk.Button(
+            controls, text="Check for updates now", style="App.TButton",
+            command=self._manual_update_check)
+        self._update_check_button.pack(anchor="w", pady=(10, 0))
         self._settings_theme_widgets = [outer, palette_box, grid, controls,
                                         self._settings_title, self._settings_subtitle,
                                         self._topmost_checkbutton]
@@ -1953,6 +2075,10 @@ class AutoTyperV2App(_TkBase):
             row=1, column=0, sticky="w", pady=(2, 0))
         self.settings_btn = ttk.Button(header, text="⚙ Settings", style="App.TButton", command=self._open_settings)
         self.settings_btn.grid(row=0, column=1, rowspan=2, sticky="e")
+        # Not gridded here: it only appears when a newer version is found,
+        # and clicking it only opens the download page -- never forces.
+        self.update_btn = ttk.Button(header, text="⬆ Update available", style="App.TButton",
+                                     command=self._open_update_page)
 
         body = ttk.Frame(self, style="App.TFrame", padding=(24, 8, 24, 8))
         body.pack(fill="both", expand=True)
@@ -2153,6 +2279,10 @@ class AutoTyperV2App(_TkBase):
                     self.progress["value"] = msg[1]
                 elif kind == "done":
                     self._finish(msg[1])
+                elif kind == "update":
+                    self._on_update_available(msg[1])
+                elif kind == "update_manual":
+                    self._on_manual_update_result(msg[1], msg[2])
                 elif kind == "error":
                     self._finish("Failed")
                     messagebox.showerror("Execution Failed", msg[1])
@@ -2234,9 +2364,82 @@ class AutoTyperV2App(_TkBase):
         except Exception as err:
             self._post("error", f"{type(err).__name__}: {err}")
 
+    # ------------------------------------------------------------------
+    # Update checking (silent unless a newer version exists)
+    # ------------------------------------------------------------------
+    def _start_update_check(self):
+        """Compare APP_VERSION with the published copy on GitHub main.
+
+        Runs once, in a background daemon thread, every time the window is
+        opened. It must never delay startup, and it stays completely silent
+        when no newer version exists or when the check cannot be performed
+        (offline, GitHub unreachable, malformed response).
+        """
+        threading.Thread(target=self._update_check_worker, daemon=True).start()
+
+    def _update_check_worker(self):
+        latest = UpdateChecker().fetch_latest_version()
+        announce = update_to_announce(latest, APP_VERSION)
+        if announce is not None:
+            self._post("update", announce)
+
+    def _manual_update_check(self):
+        """User-initiated check from the settings window."""
+        self._post("status", "Status: Checking for updates...", self.colors["muted"])
+        threading.Thread(target=self._manual_update_worker, daemon=True).start()
+
+    def _manual_update_worker(self):
+        latest = UpdateChecker().fetch_latest_version()
+        if latest is None:
+            self._post("update_manual", "unavailable", None)
+        elif is_newer_version(latest, APP_VERSION):
+            self._post("update_manual", "newer", latest)
+        else:
+            self._post("update_manual", "current", latest)
+
+    def _open_update_page(self):
+        webbrowser.open(UPDATE_PAGE_URL)
+
+    def _on_update_available(self, latest: str):
+        """Announce an available update without forcing anything."""
+        self.status_label.config(
+            text=f"Status: Update available — v{latest} (you have v{APP_VERSION})",
+            foreground=self.colors["accent"],
+        )
+        try:
+            self.update_btn.config(text=f"⬆ Update to v{latest}")
+            self.update_btn.grid(row=0, column=2, rowspan=2, sticky="e", padx=(6, 0))
+        except tk.TclError:
+            pass
+        if messagebox.askyesno(
+            "Update available",
+            f"Auto-Typer V2 v{latest} is available (you have v{APP_VERSION}).\n\n"
+            f"Open the download page in your browser?\n\n"
+            f"You can keep using this version either way -- updating is always optional.",
+            icon="question",
+            parent=self,
+        ):
+            webbrowser.open(UPDATE_PAGE_URL)
+
+    def _on_manual_update_result(self, outcome: str, latest):
+        if outcome == "newer":
+            self._on_update_available(latest)
+        elif outcome == "current":
+            self._post("status", f"Status: Up to date (v{APP_VERSION})", self.colors["foreground"])
+            messagebox.showinfo("Up to date",
+                                f"You are running the latest version (v{APP_VERSION}).",
+                                parent=self)
+        else:
+            messagebox.showwarning(
+                "Update check unavailable",
+                "Could not reach GitHub to check for updates.\n"
+                "Check your internet connection and try again.",
+                parent=self,
+            )
+
 
 # =============================================================================
-# 11. COMMAND LINE ENTRY POINT
+# 12. COMMAND LINE ENTRY POINT
 # =============================================================================
 
 def main(argv=None):
@@ -2257,7 +2460,21 @@ def main(argv=None):
     ap.add_argument("--chars", type=int, default=10000, help="characters to simulate in sample corpus")
     ap.add_argument("--file", type=str, default=None, help="file to simulate instead of default sample")
     ap.add_argument("--csv", type=str, default=None, help="export simulated trace to CSV file")
+    ap.add_argument("--check-update", action="store_true",
+                    help="compare this install's APP_VERSION with the published one and exit")
     args = ap.parse_args(argv)
+
+    if args.check_update:
+        latest = UpdateChecker().fetch_latest_version()
+        if latest is None:
+            print(f"Could not check for updates ({UPDATE_SOURCE_URL}).")
+            return 1
+        if is_newer_version(latest, APP_VERSION):
+            print(f"Update available: v{latest} (this install: v{APP_VERSION}).")
+            print(f"Download: {UPDATE_PAGE_URL}")
+        else:
+            print(f"Auto-Typer V2 is up to date (v{APP_VERSION}; published version: v{latest}).")
+        return 0
 
     if args.benchmark:
         typo_probability = args.typo / 100.0
