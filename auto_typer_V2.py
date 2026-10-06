@@ -24,6 +24,9 @@ A next-generation human typing simulator implementing:
   8. Silent Update Check (compares APP_VERSION against the published copy on
      GitHub each time the UI opens; stays completely quiet unless a newer
      version exists, and never blocks startup or forces an upgrade).
+  9. Custom UI Colours (v2.0.1): a Microsoft-Paint style hexagon ("honeycomb")
+     colour picker that lets you choose a primary, accent and background
+     colour, name the result and save it alongside the built-in palettes.
 
 Usage:
     python auto_typer_V2.py --benchmark --wpm 110 --mode net --coding-mode --file code.pas
@@ -35,6 +38,7 @@ Usage:
 import argparse
 import csv
 import json
+import colorsys
 import math
 import queue
 import random
@@ -58,7 +62,7 @@ try:
 except ImportError:
     tk = messagebox = ttk = None
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 GITHUB_REPO = "jkjklol308-alt/pascal_typing"
 UPDATE_SOURCE_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/auto_typer_V2.py"
 UPDATE_PAGE_URL = f"https://github.com/{GITHUB_REPO}/blob/main/auto_typer_V2.py"
@@ -1638,7 +1642,6 @@ PALETTE_DEFINITIONS = {
     "Soft Lavender": ("#5B21B6", "#8B5CF6", "#FAFAFE"),
     "Sunset Glow": ("#9A3412", "#F97316", "#FFF7ED"),
     "Berry Modern": ("#9D174D", "#EC4899", "#FDF2F8"),
-    "Warm Terracotta": ("#7C2D12", "#EA580C", "#FBFBF9"),
     "Sage Wellness": ("#2D3A34", "#4CAF50", "#F4F7F5"),
     "Ocean Breeze": ("#0369A1", "#0EA5E9", "#F0F9FF"),
     "Luxury Gold": ("#1E1B4B", "#D97706", "#FAFAF9"),
@@ -1663,8 +1666,17 @@ def _colour_is_dark(colour: str) -> bool:
     return (0.299 * r + 0.587 * g + 0.114 * b) < 145
 
 
-def _palette_colours(name: str) -> Dict[str, str]:
-    primary, accent, background = PALETTE_DEFINITIONS[name]
+DEFAULT_PALETTE = "Trust Corporate"
+
+
+def _palette_colours(name: str, definitions: Optional[Dict[str, Tuple[str, str, str]]] = None) -> Dict[str, str]:
+    """Derive the full colour role map for a named palette.
+
+    ``definitions`` lets the caller mix user-defined palettes into the lookup
+    without touching the built-in table.
+    """
+    table = PALETTE_DEFINITIONS if definitions is None else definitions
+    primary, accent, background = table[name]
     dark = _colour_is_dark(background)
     return {
         "primary": primary,
@@ -1679,6 +1691,167 @@ def _palette_colours(name: str) -> Dict[str, str]:
         "accent_foreground": "#FFFFFF" if _colour_is_dark(accent) else "#111827",
         "muted": "#CBD5E1" if dark else "#526176",
     }
+
+
+# =============================================================================
+# 11a. CUSTOM UI COLOURS — MS-PAINT STYLE HEXAGON ("HONEYCOMB") PICKER MODEL
+# =============================================================================
+#
+# Everything in this block is pure data: no Tk objects are touched, so the
+# honeycomb geometry, the colour ramps and the saved-palette validation can be
+# unit tested headlessly. The Tk widgets further down only render this model.
+
+HEXAGON_RINGS = 5            # rings of swatches around the white centre cell
+GREYSCALE_STEPS = 13         # black -> white strip underneath the honeycomb
+MAX_CUSTOM_PALETTES = 16     # guard against an unbounded settings file
+CUSTOM_PALETTE_ROLES = ("primary", "accent", "background")
+
+_HEX_COLOUR_RE = re.compile(r"^#?([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$")
+
+# Axial (q, r) neighbour directions for a pointy-top hexagonal grid.
+_AXIAL_DIRECTIONS = ((1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1))
+
+
+@dataclass(frozen=True)
+class HexCell:
+    """One hexagonal swatch of the honeycomb."""
+    q: int
+    r: int
+    ring: int
+    colour: str
+
+
+def normalise_hex_colour(value) -> Optional[str]:
+    """Return ``#RRGGBB`` (upper case) for any accepted hex spelling.
+
+    Accepts ``#abc``, ``abc``, ``#AABBCC`` and ``aabbcc``. Returns None for
+    anything that is not a usable colour so callers can reject bad input from
+    the hex entry box or from a hand-edited settings file.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _HEX_COLOUR_RE.match(value.strip())
+    if match is None:
+        return None
+    digits = match.group(1)
+    if len(digits) == 3:
+        digits = "".join(ch * 2 for ch in digits)
+    return "#" + digits.upper()
+
+
+def hsv_to_hex(hue: float, saturation: float, value: float) -> str:
+    """Convert HSV (each 0..1, hue wrapping) to a ``#RRGGBB`` string."""
+    r, g, b = colorsys.hsv_to_rgb(hue % 1.0, min(max(saturation, 0.0), 1.0),
+                                  min(max(value, 0.0), 1.0))
+    return "#{:02X}{:02X}{:02X}".format(round(r * 255), round(g * 255), round(b * 255))
+
+
+def hexagon_ring_colour(ring: int, rings: int, hue: float) -> str:
+    """Colour for a cell on ``ring`` at angular position ``hue`` (0..1).
+
+    Mirrors the Microsoft colour hexagon: white in the middle, progressively
+    more saturated tints as you move outwards, and a ring of darker shades
+    right on the rim.
+    """
+    if ring <= 0:
+        return "#FFFFFF"
+    if ring >= rings:
+        return hsv_to_hex(hue, 1.0, 0.56)
+    saturation = ring / max(1, rings - 1)
+    return hsv_to_hex(hue, saturation, 1.0)
+
+
+def build_colour_hexagon(rings: int = HEXAGON_RINGS) -> List[HexCell]:
+    """Build the honeycomb: one white centre plus ``6 * ring`` cells per ring."""
+    cells = [HexCell(0, 0, 0, "#FFFFFF")]
+    for ring in range(1, rings + 1):
+        # Walk the ring starting from the cell straight "below-left" of centre
+        # so that a given angular position keeps the same hue on every ring.
+        q = _AXIAL_DIRECTIONS[4][0] * ring
+        r = _AXIAL_DIRECTIONS[4][1] * ring
+        total = 6 * ring
+        index = 0
+        for dq, dr in _AXIAL_DIRECTIONS:
+            for _ in range(ring):
+                cells.append(HexCell(q, r, ring, hexagon_ring_colour(ring, rings, index / total)))
+                q += dq
+                r += dr
+                index += 1
+    return cells
+
+
+def build_greyscale_strip(steps: int = GREYSCALE_STEPS) -> List[str]:
+    """Black-to-white hexagon row shown beneath the honeycomb."""
+    steps = max(2, steps)
+    return [hsv_to_hex(0.0, 0.0, index / (steps - 1)) for index in range(steps)]
+
+
+def hexagon_centre(q: int, r: int, size: float) -> Tuple[float, float]:
+    """Pixel centre of axial cell (q, r) for pointy-top hexagons of ``size``."""
+    return (math.sqrt(3.0) * size * (q + r / 2.0), 1.5 * size * r)
+
+
+def hexagon_points(cx: float, cy: float, size: float) -> List[float]:
+    """Flattened polygon coordinates for a pointy-top hexagon."""
+    points: List[float] = []
+    for corner in range(6):
+        angle = math.radians(60.0 * corner - 90.0)
+        points.append(cx + size * math.cos(angle))
+        points.append(cy + size * math.sin(angle))
+    return points
+
+
+def sanitise_custom_palettes(raw) -> Dict[str, Tuple[str, str, str]]:
+    """Validate user-saved palettes loaded from the settings file.
+
+    Anything malformed (bad colour, wrong shape, clashing with a built-in
+    name) is dropped silently: a corrupted settings file must never stop the
+    typer from starting.
+    """
+    result: Dict[str, Tuple[str, str, str]] = {}
+    if not isinstance(raw, dict):
+        return result
+    for name, value in raw.items():
+        if not isinstance(name, str):
+            continue
+        clean = name.strip()
+        if not clean or clean in PALETTE_DEFINITIONS or clean in result:
+            continue
+        if isinstance(value, (list, tuple)) and len(value) == 3:
+            parts = [normalise_hex_colour(item) for item in value]
+        elif isinstance(value, dict):
+            parts = [normalise_hex_colour(value.get(role)) for role in CUSTOM_PALETTE_ROLES]
+        else:
+            continue
+        if any(part is None for part in parts):
+            continue
+        result[clean] = (parts[0], parts[1], parts[2])
+        if len(result) >= MAX_CUSTOM_PALETTES:
+            break
+    return result
+
+
+def merged_palettes(custom: Optional[Dict[str, Tuple[str, str, str]]] = None
+                    ) -> Dict[str, Tuple[str, str, str]]:
+    """Built-in palettes first, then the user's saved custom colours."""
+    table: Dict[str, Tuple[str, str, str]] = dict(PALETTE_DEFINITIONS)
+    for name, triple in (custom or {}).items():
+        if name in PALETTE_DEFINITIONS:
+            continue
+        table[name] = triple
+    return table
+
+
+def unique_palette_name(name: str, existing) -> str:
+    """Return ``name`` or ``name 2``/``name 3``... so saves never overwrite."""
+    taken = set(existing or ())
+    base = (name or "").strip() or "My Colours"
+    if base not in taken:
+        return base
+    index = 2
+    while f"{base} {index}" in taken:
+        index += 1
+    return f"{base} {index}"
 
 
 MODE_LABELS = {
@@ -1708,6 +1881,293 @@ class RunConfig:
 
 
 _TkBase = tk.Tk if tk is not None else object
+_TkFrame = tk.Frame if tk is not None else object
+_TkToplevel = tk.Toplevel if tk is not None else object
+
+
+class ColourHexagonPicker(_TkFrame):
+    """The Microsoft Paint / Office style colour hexagon.
+
+    A honeycomb of hexagonal swatches (white in the middle, tints fanning out
+    by hue, dark shades on the rim) plus a black-to-white hexagon strip below
+    it. This is deliberately *not* the gradient/"Define Custom Colors" square:
+    every colour is a discrete hexagon you click.
+    """
+
+    def __init__(self, master, *, rings: int = HEXAGON_RINGS, cell_size: int = 13,
+                 on_pick=None, background: str = "#FFFFFF",
+                 outline: str = "#8C96A8", highlight: str = "#111827", **kwargs):
+        super().__init__(master, bg=background, **kwargs)
+        self.rings = rings
+        self.cell_size = cell_size
+        self._on_pick = on_pick
+        self._outline = outline
+        self._highlight = highlight
+        self._item_colour: Dict[int, str] = {}
+        self._colour_items: Dict[str, List[int]] = {}
+        self._selected_item: Optional[int] = None
+        self.selected_colour: Optional[str] = None
+
+        cells = build_colour_hexagon(rings)
+        centres = [(cell, hexagon_centre(cell.q, cell.r, cell_size)) for cell in cells]
+        xs = [point[0] for _, point in centres]
+        ys = [point[1] for _, point in centres]
+        pad = cell_size * 0.9
+        offset_x = pad + cell_size - min(xs)
+        offset_y = pad + cell_size - min(ys)
+        width = (max(xs) - min(xs)) + 2 * cell_size + 2 * pad
+        honeycomb_bottom = offset_y + max(ys) + cell_size
+
+        strip = build_greyscale_strip()
+        strip_step = math.sqrt(3.0) * cell_size
+        strip_y = honeycomb_bottom + cell_size * 1.45
+        strip_width = strip_step * len(strip)
+        height = strip_y + cell_size + pad
+
+        self.canvas = tk.Canvas(self, width=round(max(width, strip_width + 2 * pad)),
+                                height=round(height), bg=background,
+                                highlightthickness=0, bd=0)
+        self.canvas.pack()
+
+        for cell, (cx, cy) in centres:
+            self._add_cell(cx + offset_x, cy + offset_y, cell.colour)
+
+        strip_x = (max(width, strip_width + 2 * pad) - strip_width) / 2.0 + strip_step / 2.0
+        for index, colour in enumerate(strip):
+            self._add_cell(strip_x + index * strip_step, strip_y, colour)
+
+    # -- construction helpers -----------------------------------------
+    def _add_cell(self, cx: float, cy: float, colour: str):
+        item = self.canvas.create_polygon(
+            hexagon_points(cx, cy, self.cell_size),
+            fill=colour, outline=self._outline, width=1, joinstyle="miter")
+        self._item_colour[item] = colour
+        self._colour_items.setdefault(colour, []).append(item)
+        self.canvas.tag_bind(item, "<Button-1>", lambda event, i=item: self._clicked(i))
+        self.canvas.tag_bind(item, "<Enter>",
+                             lambda event, i=item: self.canvas.configure(cursor="hand2"))
+        self.canvas.tag_bind(item, "<Leave>",
+                             lambda event: self.canvas.configure(cursor=""))
+
+    # -- interaction ---------------------------------------------------
+    def _clicked(self, item: int):
+        colour = self._item_colour.get(item)
+        if colour is None:
+            return
+        self._highlight_item(item)
+        self.selected_colour = colour
+        if self._on_pick is not None:
+            self._on_pick(colour)
+
+    def _highlight_item(self, item: Optional[int]):
+        if self._selected_item is not None:
+            try:
+                self.canvas.itemconfigure(self._selected_item, outline=self._outline, width=1)
+            except tk.TclError:
+                pass
+        self._selected_item = item
+        if item is not None:
+            try:
+                self.canvas.itemconfigure(item, outline=self._highlight, width=3)
+                self.canvas.tag_raise(item)
+            except tk.TclError:
+                pass
+
+    def set_selected(self, colour: Optional[str]):
+        """Highlight the hexagon holding ``colour`` (no callback fired)."""
+        normalised = normalise_hex_colour(colour) if colour else None
+        self.selected_colour = normalised
+        items = self._colour_items.get(normalised or "", [])
+        self._highlight_item(items[0] if items else None)
+
+    def swatch_colours(self) -> List[str]:
+        """Every colour offered by the honeycomb, in drawing order."""
+        return [self._item_colour[item] for item in sorted(self._item_colour)]
+
+
+class CustomPaletteEditor(_TkToplevel):
+    """Dialog that builds and saves a user-defined palette.
+
+    Three colour roles (primary, accent, background) are filled in from the
+    hexagon picker or typed as hex, previewed live, named, and then handed
+    back to the app through ``on_save``.
+    """
+
+    def __init__(self, master, colours: Dict[str, str], *, on_save,
+                 initial: Optional[Tuple[str, str, str]] = None,
+                 initial_name: str = "", editing: Optional[str] = None,
+                 topmost: bool = False):
+        super().__init__(master)
+        self._on_save = on_save
+        self._editing = editing
+        c = colours
+        base = initial or ("#1E3A8A", "#3B82F6", "#F8FAFC")
+        self._values = {
+            "primary": normalise_hex_colour(base[0]) or "#1E3A8A",
+            "accent": normalise_hex_colour(base[1]) or "#3B82F6",
+            "background": normalise_hex_colour(base[2]) or "#F8FAFC",
+        }
+
+        self.title("Custom UI Colour — colour hexagon")
+        self.configure(background=c["background"])
+        self.resizable(False, False)
+        try:
+            self.transient(master)
+        except tk.TclError:
+            pass
+        if topmost:
+            try:
+                self.wm_attributes("-topmost", True)
+            except tk.TclError:
+                pass
+
+        body = tk.Frame(self, bg=c["background"], padx=18, pady=16)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text="Custom UI Colour", bg=c["background"], fg=c["primary"],
+                 font=("Segoe UI", 16, "bold")).pack(anchor="w")
+        tk.Label(body,
+                 text="Pick a hexagon for each role, name the set, then save it with the other palettes.",
+                 bg=c["background"], fg=c["muted"], font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 12))
+
+        main = tk.Frame(body, bg=c["background"])
+        main.pack(fill="both", expand=True)
+
+        left = tk.Frame(main, bg=c["background"])
+        left.pack(side="left", anchor="n")
+        self.picker = ColourHexagonPicker(left, on_pick=self._picked,
+                                          background=c["surface"],
+                                          outline=c["muted"], highlight=c["foreground"],
+                                          highlightthickness=1,
+                                          highlightbackground=c["muted"])
+        self.picker.pack(anchor="n")
+
+        hex_row = tk.Frame(left, bg=c["background"])
+        hex_row.pack(fill="x", pady=(10, 0))
+        tk.Label(hex_row, text="Hex", bg=c["background"], fg=c["foreground"],
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self.hex_var = tk.StringVar()
+        self.hex_entry = tk.Entry(hex_row, textvariable=self.hex_var, width=10,
+                                  bg=c["surface"], fg=c["foreground"],
+                                  insertbackground=c["foreground"], relief="flat",
+                                  highlightthickness=1, highlightbackground=c["muted"],
+                                  font=("Consolas", 10))
+        self.hex_entry.pack(side="left", padx=(8, 8))
+        self.hex_entry.bind("<Return>", lambda event: self._apply_typed_hex())
+        tk.Button(hex_row, text="Use hex", command=self._apply_typed_hex, relief="flat",
+                  bg=c["primary"], fg=c["button_foreground"],
+                  activebackground=c["accent"], activeforeground=c["accent_foreground"],
+                  padx=10, pady=2, font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._hex_hint = tk.Label(hex_row, text="", bg=c["background"], fg=c["muted"],
+                                  font=("Segoe UI", 8))
+        self._hex_hint.pack(side="left", padx=(8, 0))
+
+        right = tk.Frame(main, bg=c["background"])
+        right.pack(side="left", anchor="n", padx=(20, 0), fill="both", expand=True)
+
+        tk.Label(right, text="Colour being edited", bg=c["background"], fg=c["primary"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.role_var = tk.StringVar(value="primary")
+        self._role_swatches = {}
+        self._role_labels = {}
+        for role, caption in (("primary", "Primary (headings, buttons)"),
+                              ("accent", "Accent (highlights, progress)"),
+                              ("background", "Background (window + panels)")):
+            row = tk.Frame(right, bg=c["background"])
+            row.pack(fill="x", pady=3)
+            radio = tk.Radiobutton(row, text=caption, value=role, variable=self.role_var,
+                                   command=self._role_changed, bg=c["background"],
+                                   fg=c["foreground"], activebackground=c["background"],
+                                   activeforeground=c["foreground"], selectcolor=c["surface"],
+                                   anchor="w", font=("Segoe UI", 9))
+            radio.pack(side="left", anchor="w")
+            swatch = tk.Frame(row, width=34, height=18, bg=self._values[role],
+                              highlightthickness=1, highlightbackground=c["foreground"])
+            swatch.pack(side="right")
+            label = tk.Label(row, text=self._values[role], bg=c["background"], fg=c["muted"],
+                             font=("Consolas", 9))
+            label.pack(side="right", padx=(0, 8))
+            self._role_swatches[role] = swatch
+            self._role_labels[role] = label
+
+        tk.Label(right, text="Preview", bg=c["background"], fg=c["primary"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(14, 4))
+        self._preview = tk.Frame(right, height=96, highlightthickness=1,
+                                 highlightbackground=c["muted"])
+        self._preview.pack(fill="x")
+        self._preview.pack_propagate(False)
+        self._preview_title = tk.Label(self._preview, text="Auto-Typer V2", font=("Segoe UI", 12, "bold"))
+        self._preview_title.pack(anchor="w", padx=10, pady=(12, 0))
+        self._preview_body = tk.Label(self._preview, text="Your colours, applied live.",
+                                      font=("Segoe UI", 9))
+        self._preview_body.pack(anchor="w", padx=10)
+        self._preview_button = tk.Label(self._preview, text="  Accent button  ", font=("Segoe UI", 9, "bold"))
+        self._preview_button.pack(anchor="w", padx=10, pady=(8, 0))
+
+        tk.Label(right, text="Palette name", bg=c["background"], fg=c["primary"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(14, 4))
+        self.name_var = tk.StringVar(value=initial_name or "My Colours")
+        tk.Entry(right, textvariable=self.name_var, bg=c["surface"], fg=c["foreground"],
+                 insertbackground=c["foreground"], relief="flat", highlightthickness=1,
+                 highlightbackground=c["muted"], font=("Segoe UI", 10)).pack(fill="x")
+
+        buttons = tk.Frame(body, bg=c["background"])
+        buttons.pack(fill="x", pady=(16, 0))
+        tk.Button(buttons, text="Cancel", command=self.destroy, relief="flat",
+                  bg=c["surface"], fg=c["foreground"], activebackground=c["muted"],
+                  padx=14, pady=5, font=("Segoe UI", 9)).pack(side="right")
+        tk.Button(buttons, text="Save colours", command=self._save, relief="flat",
+                  bg=c["accent"], fg=c["accent_foreground"],
+                  activebackground=c["primary"], activeforeground=c["button_foreground"],
+                  padx=16, pady=5, font=("Segoe UI", 9, "bold")).pack(side="right", padx=(0, 8))
+
+        self._role_changed()
+        self._refresh_preview()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    # -- internals -----------------------------------------------------
+    def _picked(self, colour: str):
+        self._set_role_colour(self.role_var.get(), colour)
+
+    def _apply_typed_hex(self):
+        colour = normalise_hex_colour(self.hex_var.get())
+        if colour is None:
+            self._hex_hint.configure(text="use #RRGGBB")
+            return
+        self._hex_hint.configure(text="")
+        self._set_role_colour(self.role_var.get(), colour)
+        self.picker.set_selected(colour)
+
+    def _set_role_colour(self, role: str, colour: str):
+        colour = normalise_hex_colour(colour) or self._values[role]
+        self._values[role] = colour
+        self.hex_var.set(colour)
+        self._role_swatches[role].configure(bg=colour)
+        self._role_labels[role].configure(text=colour)
+        self._refresh_preview()
+
+    def _role_changed(self):
+        colour = self._values[self.role_var.get()]
+        self.hex_var.set(colour)
+        self.picker.set_selected(colour)
+
+    def _refresh_preview(self):
+        preview = _palette_colours("__preview__", {"__preview__": self.triple()})
+        self._preview.configure(bg=preview["background"])
+        self._preview_title.configure(bg=preview["background"], fg=preview["primary"])
+        self._preview_body.configure(bg=preview["background"], fg=preview["foreground"])
+        self._preview_button.configure(bg=preview["accent"], fg=preview["accent_foreground"])
+
+    def triple(self) -> Tuple[str, str, str]:
+        return (self._values["primary"], self._values["accent"], self._values["background"])
+
+    def _save(self):
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Name needed", "Give your colours a name before saving.",
+                                   parent=self)
+            return
+        self._on_save(name, self.triple(), self._editing)
+        self.destroy()
 
 
 class AutoTyperV2App(_TkBase):
@@ -1729,15 +2189,20 @@ class AutoTyperV2App(_TkBase):
         self.msg_queue = queue.Queue()
         self.worker_thread = None
         saved_settings = self._load_ui_settings()
-        self.palette_name = saved_settings.get("palette", "Trust Corporate")
-        if self.palette_name not in PALETTE_DEFINITIONS:
-            self.palette_name = "Trust Corporate"
+        self.custom_palettes = sanitise_custom_palettes(saved_settings.get("custom_palettes"))
+        self.palette_name = saved_settings.get("palette", DEFAULT_PALETTE)
+        if self.palette_name not in self.available_palettes():
+            self.palette_name = DEFAULT_PALETTE
         self.palette_var = tk.StringVar(value=self.palette_name)
         self.topmost_var = tk.BooleanVar(value=bool(saved_settings.get("topmost", True)))
-        self.colors = _palette_colours(self.palette_name)
+        self.colors = _palette_colours(self.palette_name, self.available_palettes())
         self._settings_window = None
         self._settings_cards = []
         self._settings_theme_widgets = []
+        self._settings_headings = []
+        self._palette_grid = None
+        self._custom_hint = None
+        self._custom_editor = None
         self._preview_widgets = {}
         self._comboboxes = []
 
@@ -1801,6 +2266,11 @@ class AutoTyperV2App(_TkBase):
         self.style.configure("App.TEntry", fieldbackground=c["surface"], background=c["surface"],
                              foreground=c["foreground"], padding=(6, 4))
         self.style.configure("App.Horizontal.TProgressbar", background=c["accent"], troughcolor=c["surface"])
+        self.style.configure("App.Vertical.TScrollbar", background=c["surface"],
+                             troughcolor=c["background"], bordercolor=c["surface"],
+                             arrowcolor=c["foreground"], lightcolor=c["surface"],
+                             darkcolor=c["surface"])
+        self.style.map("App.Vertical.TScrollbar", background=[("active", c["accent"])])
 
     @staticmethod
     def _ui_settings_path() -> Path:
@@ -1821,17 +2291,94 @@ class AutoTyperV2App(_TkBase):
             path.write_text(json.dumps({
                 "palette": self.palette_name,
                 "topmost": bool(self.topmost_var.get()),
+                "custom_palettes": {name: list(triple)
+                                    for name, triple in self.custom_palettes.items()},
             }, indent=2) + "\n", encoding="utf-8")
         except (OSError, TypeError, tk.TclError):
             # A read-only home directory must not stop the typer.
             pass
 
+    # ------------------------------------------------------------------
+    # Custom UI colours
+    # ------------------------------------------------------------------
+    def available_palettes(self) -> Dict[str, Tuple[str, str, str]]:
+        """Built-in palettes plus every custom palette the user has saved."""
+        return merged_palettes(getattr(self, "custom_palettes", {}))
+
+    def is_custom_palette(self, name: str) -> bool:
+        return name in getattr(self, "custom_palettes", {})
+
+    def _open_custom_editor(self, name: Optional[str] = None):
+        """Open the colour hexagon editor for a new or existing custom palette."""
+        if self._custom_editor is not None:
+            try:
+                if self._custom_editor.winfo_exists():
+                    self._custom_editor.deiconify()
+                    self._custom_editor.lift()
+                    return
+            except tk.TclError:
+                pass
+        if name is None and len(self.custom_palettes) >= MAX_CUSTOM_PALETTES:
+            messagebox.showinfo(
+                "Custom colours full",
+                f"You can keep up to {MAX_CUSTOM_PALETTES} custom palettes. "
+                "Delete one before saving another.")
+            return
+        initial = self.custom_palettes.get(name) if name else self.available_palettes()[self.palette_name]
+        self._custom_editor = CustomPaletteEditor(
+            self, self.colors,
+            on_save=self._save_custom_palette,
+            initial=initial,
+            initial_name=name or "My Colours",
+            editing=name,
+            topmost=bool(self.topmost_var.get()),
+        )
+
+    def _save_custom_palette(self, name: str, triple: Tuple[str, str, str],
+                             editing: Optional[str] = None):
+        """Store a palette from the editor, then select it immediately."""
+        cleaned = sanitise_custom_palettes({name: list(triple)})
+        if not cleaned:
+            return
+        name = next(iter(cleaned))
+        new_triple = cleaned[name]
+        if editing and editing in self.custom_palettes:
+            # Rebuild in place so renaming keeps the palette's grid position.
+            updated = {}
+            for existing_name, existing_triple in self.custom_palettes.items():
+                if existing_name == editing:
+                    updated[name] = new_triple
+                else:
+                    updated[existing_name] = existing_triple
+            self.custom_palettes = updated
+        else:
+            if name in self.available_palettes():
+                name = unique_palette_name(name, self.available_palettes())
+            self.custom_palettes[name] = new_triple
+        self._refresh_palette_cards()
+        self._apply_palette(name)
+
+    def _delete_custom_palette(self):
+        """Remove the selected custom palette (built-ins cannot be deleted)."""
+        name = self.palette_name
+        if not self.is_custom_palette(name):
+            messagebox.showinfo(
+                "Nothing to delete",
+                "Select one of your own saved colours first — built-in palettes stay put.")
+            return
+        if not messagebox.askyesno("Delete custom colours", f"Delete the palette “{name}”?"):
+            return
+        self.custom_palettes.pop(name, None)
+        self._refresh_palette_cards()
+        self._apply_palette(DEFAULT_PALETTE)
+
     def _apply_palette(self, name: str):
-        if name not in PALETTE_DEFINITIONS:
-            name = "Trust Corporate"
+        palettes = self.available_palettes()
+        if name not in palettes:
+            name = DEFAULT_PALETTE
         self.palette_name = name
         self.palette_var.set(name)
-        self.colors = _palette_colours(name)
+        self.colors = _palette_colours(name, palettes)
         self._save_ui_settings()
         self.configure(background=self.colors["background"])
         self._configure_styles()
@@ -1906,12 +2453,13 @@ class AutoTyperV2App(_TkBase):
             self._settings_window.lift()
             return
 
+        c = self.colors
         window = tk.Toplevel(self)
         self._settings_window = window
         window.title("Auto-Typer V2 — Appearance & Window Settings")
-        window.geometry("700x760")
-        window.minsize(620, 620)
-        window.configure(background=self.colors["background"])
+        window.geometry("720x840")
+        window.minsize(640, 620)
+        window.configure(background=c["background"])
         window.protocol("WM_DELETE_WINDOW", self._close_settings)
         if self.topmost_var.get():
             try:
@@ -1919,79 +2467,78 @@ class AutoTyperV2App(_TkBase):
             except tk.TclError:
                 pass
 
-        outer = tk.Frame(window, bg=self.colors["background"], padx=22, pady=18)
-        outer.pack(fill="both", expand=True)
-        self._settings_title = tk.Label(outer, text="Appearance & Window Settings", bg=self.colors["background"],
-                                         fg=self.colors["primary"], font=("Segoe UI", 18, "bold"))
+        # The palette grid and the custom colour section together are taller
+        # than a laptop screen, so the whole body scrolls.
+        scroller = tk.Canvas(window, bg=c["background"], highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(window, orient="vertical", command=scroller.yview,
+                                  style="App.Vertical.TScrollbar")
+        scroller.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        scroller.pack(side="left", fill="both", expand=True)
+        outer = tk.Frame(scroller, bg=c["background"], padx=22, pady=18)
+        body_id = scroller.create_window((0, 0), window=outer, anchor="nw")
+        outer.bind("<Configure>",
+                   lambda event: scroller.configure(scrollregion=scroller.bbox("all")))
+        scroller.bind("<Configure>",
+                      lambda event: scroller.itemconfigure(body_id, width=event.width))
+        self._bind_settings_mousewheel(scroller)
+
+        self._settings_title = tk.Label(outer, text="Appearance & Window Settings", bg=c["background"],
+                                        fg=c["primary"], font=("Segoe UI", 18, "bold"))
         self._settings_title.pack(anchor="w")
         self._settings_subtitle = tk.Label(
-            outer, text="Choose a palette and keep the typer visible while you work in your editor.",
-            bg=self.colors["background"], fg=self.colors["muted"], font=("Segoe UI", 10))
+            outer, text="Choose a palette, design your own colours, and keep the typer visible while you work.",
+            bg=c["background"], fg=c["muted"], font=("Segoe UI", 10))
         self._settings_subtitle.pack(anchor="w", pady=(2, 14))
 
-        palette_box = tk.LabelFrame(outer, text=" Colour palette ", bg=self.colors["background"],
-                                    fg=self.colors["primary"], bd=1, relief="groove",
+        palette_box = tk.LabelFrame(outer, text=" Colour palette ", bg=c["background"],
+                                    fg=c["primary"], bd=1, relief="groove",
                                     padx=12, pady=10, font=("Segoe UI", 10, "bold"))
         palette_box.pack(fill="both", expand=True)
-        grid = tk.Frame(palette_box, bg=self.colors["background"])
+        grid = tk.Frame(palette_box, bg=c["background"])
         grid.pack(fill="both", expand=True)
-        for column in range(4):
-            grid.columnconfigure(column, weight=1)
-        for row in range(5):
-            grid.rowconfigure(row, weight=1)
+        self._palette_grid = grid
 
-        self._settings_cards = []
-        for index, name in enumerate(PALETTE_DEFINITIONS):
-            card = tk.Frame(grid, bg=self.colors["background"], padx=7, pady=7,
-                            highlightthickness=1, highlightbackground=self.colors["surface"])
-            card.grid(row=index // 4, column=index % 4, sticky="nsew", padx=4, pady=4)
-            radio = tk.Radiobutton(card, text=name, variable=self.palette_var, value=name,
-                                   command=lambda selected=name: self._choose_palette(selected),
-                                   anchor="w", justify="left", wraplength=135,
-                                   bg=self.colors["background"], fg=self.colors["foreground"],
-                                   activebackground=self.colors["background"],
-                                   activeforeground=self.colors["foreground"],
-                                   selectcolor=self.colors["surface"], font=("Segoe UI", 9))
-            radio.pack(fill="x", anchor="w")
-            swatches = tk.Frame(card, bg=self.colors["background"])
-            swatches.pack(anchor="w", pady=(5, 0))
-            for colour in PALETTE_DEFINITIONS[name]:
-                tk.Frame(swatches, width=28, height=16, bg=colour,
-                         highlightthickness=1, highlightbackground=self.colors["foreground"]).pack(side="left", padx=(0, 3))
-            self._settings_cards.append((card, radio, swatches, name))
+        custom_box = tk.LabelFrame(outer, text=" Custom UI colour ", bg=c["background"],
+                                   fg=c["primary"], bd=1, relief="groove",
+                                   padx=12, pady=10, font=("Segoe UI", 10, "bold"))
+        custom_box.pack(fill="x", pady=(14, 0))
+        self._custom_hint = tk.Label(
+            custom_box,
+            text="", bg=c["background"], fg=c["muted"], font=("Segoe UI", 9),
+            justify="left", anchor="w")
+        self._custom_hint.pack(anchor="w", pady=(0, 8))
+        custom_buttons = tk.Frame(custom_box, bg=c["background"])
+        custom_buttons.pack(anchor="w")
+        ttk.Button(custom_buttons, text="🎨 New colours…", style="Accent.TButton",
+                   command=lambda: self._open_custom_editor(None)).pack(side="left")
+        ttk.Button(custom_buttons, text="Edit selected", style="App.TButton",
+                   command=self._edit_selected_custom_palette).pack(side="left", padx=(8, 0))
+        ttk.Button(custom_buttons, text="Delete selected", style="App.TButton",
+                   command=self._delete_custom_palette).pack(side="left", padx=(8, 0))
 
-            # Make the whole card, including whitespace and colour swatches,
-            # behave like one large palette selector instead of requiring a
-            # precise click on the radio control.
-            for selectable in (card, radio, swatches, *swatches.winfo_children()):
-                selectable.bind("<Button-1>", lambda event, selected=name: self._choose_palette(selected))
-
-        controls = tk.Frame(outer, bg=self.colors["background"])
+        controls = tk.Frame(outer, bg=c["background"])
         controls.pack(fill="x", pady=(14, 10))
         self._topmost_checkbutton = tk.Checkbutton(
             controls,
             text="Keep Auto-Typer above other applications (prevents it disappearing when you click your editor)",
             variable=self.topmost_var,
             command=self._apply_topmost,
-            bg=self.colors["background"], fg=self.colors["foreground"],
-            activebackground=self.colors["background"], activeforeground=self.colors["foreground"],
-            selectcolor=self.colors["surface"], anchor="w",
+            bg=c["background"], fg=c["foreground"],
+            activebackground=c["background"], activeforeground=c["foreground"],
+            selectcolor=c["surface"], anchor="w",
         )
         self._topmost_checkbutton.pack(anchor="w")
         self._update_check_button = ttk.Button(
             controls, text="Check for updates now", style="App.TButton",
             command=self._manual_update_check)
         self._update_check_button.pack(anchor="w", pady=(10, 0))
-        self._settings_theme_widgets = [outer, palette_box, grid, controls,
-                                        self._settings_title, self._settings_subtitle,
-                                        self._topmost_checkbutton]
 
-        preview_box = tk.LabelFrame(outer, text=" Live preview ", bg=self.colors["background"],
-                                    fg=self.colors["primary"], bd=1, relief="groove",
+        preview_box = tk.LabelFrame(outer, text=" Live preview ", bg=c["background"],
+                                    fg=c["primary"], bd=1, relief="groove",
                                     padx=12, pady=10, font=("Segoe UI", 10, "bold"))
         preview_box.pack(fill="x", pady=(0, 10))
-        self._settings_theme_widgets.append(preview_box)
-        preview = tk.Frame(preview_box, bg=self.colors["background"], height=86)
+        preview = tk.Frame(preview_box, bg=c["background"], height=86)
         preview.pack(fill="x")
         preview.pack_propagate(False)
         self._preview_widgets = {
@@ -2004,9 +2551,105 @@ class AutoTyperV2App(_TkBase):
         self._preview_widgets["title"].pack(side="left", padx=(4, 20), pady=22)
         self._preview_widgets["body"].pack(side="left", fill="x", expand=True, pady=22)
         self._preview_widgets["button"].pack(side="right", padx=4, pady=20)
-        self._refresh_settings_window()
+
+        self._settings_theme_widgets = [scroller, outer, palette_box, grid, custom_box,
+                                        custom_buttons, controls, preview_box, preview,
+                                        self._settings_title, self._settings_subtitle,
+                                        self._custom_hint, self._topmost_checkbutton]
+        self._settings_headings = [palette_box, custom_box, preview_box]
 
         ttk.Button(outer, text="Close", style="App.TButton", command=self._close_settings).pack(anchor="e")
+
+        self._refresh_palette_cards()
+        self._refresh_settings_window()
+
+    def _bind_settings_mousewheel(self, scroller):
+        """Scroll the settings body with the wheel on Windows, macOS and X11."""
+        def on_wheel(event):
+            if event.num == 4:
+                delta = -1
+            elif event.num == 5:
+                delta = 1
+            else:
+                delta = -1 if event.delta > 0 else 1
+            scroller.yview_scroll(delta, "units")
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            scroller.bind_all(sequence, on_wheel, add="+")
+        self._settings_wheel_bindings = ("<MouseWheel>", "<Button-4>", "<Button-5>")
+
+    def _edit_selected_custom_palette(self):
+        if not self.is_custom_palette(self.palette_name):
+            messagebox.showinfo(
+                "Pick your own colours first",
+                "Select one of your saved custom palettes to edit it, or press "
+                "“New colours…” to design one from the colour hexagon.")
+            return
+        self._open_custom_editor(self.palette_name)
+
+    def _refresh_palette_cards(self):
+        """(Re)build the palette grid so saved custom colours appear in it."""
+        grid = self._palette_grid
+        if grid is None:
+            return
+        try:
+            if not grid.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        for child in grid.winfo_children():
+            child.destroy()
+        self._settings_cards = []
+
+        c = self.colors
+        palettes = self.available_palettes()
+        columns = 4
+        for column in range(columns):
+            grid.columnconfigure(column, weight=1)
+        rows = max(1, (len(palettes) + columns - 1) // columns)
+        for row in range(rows):
+            grid.rowconfigure(row, weight=1)
+
+        for index, name in enumerate(palettes):
+            custom = self.is_custom_palette(name)
+            card = tk.Frame(grid, bg=c["background"], padx=7, pady=7,
+                            highlightthickness=1, highlightbackground=c["surface"])
+            card.grid(row=index // columns, column=index % columns, sticky="nsew", padx=4, pady=4)
+            radio = tk.Radiobutton(card, text=("★ " + name) if custom else name,
+                                   variable=self.palette_var, value=name,
+                                   command=lambda selected=name: self._choose_palette(selected),
+                                   anchor="w", justify="left", wraplength=135,
+                                   bg=c["background"], fg=c["foreground"],
+                                   activebackground=c["background"],
+                                   activeforeground=c["foreground"],
+                                   selectcolor=c["surface"], font=("Segoe UI", 9))
+            radio.pack(fill="x", anchor="w")
+            swatches = tk.Frame(card, bg=c["background"])
+            swatches.pack(anchor="w", pady=(5, 0))
+            for colour in palettes[name]:
+                tk.Frame(swatches, width=28, height=16, bg=colour,
+                         highlightthickness=1, highlightbackground=c["foreground"]).pack(side="left", padx=(0, 3))
+            self._settings_cards.append((card, radio, swatches, name))
+
+            # Make the whole card, including whitespace and colour swatches,
+            # behave like one large palette selector instead of requiring a
+            # precise click on the radio control.
+            for selectable in (card, radio, swatches, *swatches.winfo_children()):
+                selectable.bind("<Button-1>", lambda event, selected=name: self._choose_palette(selected))
+            if custom:
+                for selectable in (card, radio, swatches, *swatches.winfo_children()):
+                    selectable.bind("<Double-Button-1>",
+                                    lambda event, selected=name: self._open_custom_editor(selected))
+
+        if self._custom_hint is not None:
+            try:
+                saved = len(self.custom_palettes)
+                self._custom_hint.configure(
+                    text=("Design your own palette on the Microsoft-style colour hexagon: pick a "
+                          "primary, accent and background colour, name it and save.\n"
+                          f"Saved custom palettes: {saved} of {MAX_CUSTOM_PALETTES}"
+                          " — they appear with a ★ above (double-click one to edit it)."))
+            except tk.TclError:
+                pass
 
     def _refresh_settings_window(self):
         if self._settings_window is None:
@@ -2025,12 +2668,17 @@ class AutoTyperV2App(_TkBase):
                 pass
         self._settings_title.configure(bg=c["background"], fg=c["primary"])
         self._settings_subtitle.configure(bg=c["background"], fg=c["muted"])
+        if self._custom_hint is not None:
+            try:
+                self._custom_hint.configure(bg=c["background"], fg=c["muted"])
+            except tk.TclError:
+                pass
         self._topmost_checkbutton.configure(
             bg=c["background"], fg=c["foreground"],
             activebackground=c["background"], activeforeground=c["foreground"],
             selectcolor=c["surface"],
         )
-        for widget in (self._settings_theme_widgets[1], self._settings_theme_widgets[4]):
+        for widget in self._settings_headings:
             try:
                 widget.configure(fg=c["primary"])
             except tk.TclError:
@@ -2053,6 +2701,12 @@ class AutoTyperV2App(_TkBase):
                                  activebackground=c["primary"], activeforeground="#FFFFFF")
 
     def _close_settings(self):
+        for sequence in getattr(self, "_settings_wheel_bindings", ()):  # stop scrolling the dead window
+            try:
+                self.unbind_all(sequence)
+            except tk.TclError:
+                pass
+        self._settings_wheel_bindings = ()
         if self._settings_window is not None:
             try:
                 self._settings_window.destroy()
@@ -2061,6 +2715,9 @@ class AutoTyperV2App(_TkBase):
         self._settings_window = None
         self._settings_cards = []
         self._settings_theme_widgets = []
+        self._settings_headings = []
+        self._palette_grid = None
+        self._custom_hint = None
         self._preview_widgets = {}
 
     # ------------------------------------------------------------------
